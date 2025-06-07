@@ -105,8 +105,8 @@ async def health_check():
     return {"status": "running"}
 
 @app.on_event("startup")
-async def on_start():
-    await bot.set_webhook(WEBHOOK_URL)
+async on_start():
+      bot.set_webhook(WEBHOOK_URL)
 
 # Register handlers
 dispatcher.add_handler(CommandHandler("start", start))
