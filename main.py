@@ -52,7 +52,7 @@ def ask(update, context):
 
 # Command: /unlock
 def unlock(update, context):
-    with open("qr.png", "rb") as qr:
+    with open("qr.jpg", "rb") as qr:
         update.message.reply_photo(qr, caption="📥 Scan and pay using Paytm.\nThen use /verify <transaction_id>")
 
 # Command: /verify <TXN_ID>
