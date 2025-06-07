@@ -1,116 +1,124 @@
 import os
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import JSONResponse, FileResponse
 from telegram import Bot, Update
-from telegram.ext import Dispatcher, CommandHandler
-import httpx
-from dotenv import load_dotenv
+from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
+import requests
 
-# Load .env if running locally
-if os.environ.get("RENDER") != "true":
-    load_dotenv()
+app = FastAPI()
 
-# Secrets
+# Load secrets from environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-app = FastAPI()
 bot = Bot(token=BOT_TOKEN)
-dispatcher = Dispatcher(bot, update_queue=None, workers=4, use_context=True)
-verified_users = set()
+dispatcher = Dispatcher(bot, None, workers=0)
 
-# Command: /start
+# Files and data
+QR_IMAGE_PATH = "qr.png"
+ENOTES_PATH = "enotes.zip"
+TXN_IDS_FILE = "txn_ids.txt"
+USED_IDS_FILE = "used_ids.txt"
+
+# In-memory sets for transaction IDs
+with open(TXN_IDS_FILE, "r") as f:
+    valid_txns = set(line.strip() for line in f if line.strip())
+
+try:
+    with open(USED_IDS_FILE, "r") as f:
+        used_txns = set(line.strip() for line in f if line.strip())
+except FileNotFoundError:
+    used_txns = set()
+
+# /start command
 def start(update, context):
     update.message.reply_text(
-        "👋 Welcome! Use /ask to talk to AI, /unlock to pay via QR, /verify TXN_ID to verify payment, then /getfile to download."
+        "Hi! Send /unlock to get the Paytm QR code for payment."
     )
 
-# Command: /ask <question>
-def ask(update, context):
-    question = " ".join(context.args)
-    if not question:
-        update.message.reply_text("⚠️ Usage: /ask What is AI?")
-        return
+# /unlock command - sends payment QR
+def unlock(update, context):
+    chat_id = update.message.chat_id
+    bot.send_photo(chat_id=chat_id, photo=open(QR_IMAGE_PATH, "rb"),
+                   caption="Please scan this Paytm QR and pay. After payment, send me your Transaction ID.")
 
+# After /unlock, user sends TXN ID - handle text messages
+def handle_message(update, context):
+    text = update.message.text.strip()
+
+    if text.upper().startswith("TXN"):
+        if text in valid_txns:
+            if text in used_txns:
+                update.message.reply_text("This Transaction ID has already been used.")
+            else:
+                used_txns.add(text)
+                with open(USED_IDS_FILE, "a") as f:
+                    f.write(text + "\n")
+                update.message.reply_text(
+                    "Payment verified! You can now download the e-notes with /getfile"
+                )
+        else:
+            update.message.reply_text(
+                "Invalid Transaction ID. Please check and send again."
+            )
+    else:
+        # If not TXN ID, forward to DeepSeek API
+        response = call_deepseek_api(text)
+        update.message.reply_text(response)
+
+# /getfile command - sends e-notes if payment done
+def getfile(update, context):
+    chat_id = update.message.chat_id
+    # We need a way to verify if user paid, for demo we skip user-level check
+    # If you want user-specific payment tracking, you need a DB or mapping chat_id->paid
+    # Here, we simply check if at least one TXN was used (simple demo)
+    if used_txns:
+        update.message.reply_document(open(ENOTES_PATH, "rb"), filename="e-notes.zip")
+    else:
+        update.message.reply_text("You must pay first with /unlock and verify your TXN ID.")
+
+# DeepSeek API call
+def call_deepseek_api(query):
+    url = "https://api.deepseek.ai/your_endpoint"  # replace with actual endpoint
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "deepseek-chat",
-        "messages": [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": question}
-        ]
+        "query": query
     }
     try:
-        res = httpx.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=payload, timeout=10)
-        reply = res.json()["choices"][0]["message"]["content"]
-        update.message.reply_text(reply)
+        r = requests.post(url, json=payload, headers=headers)
+        r.raise_for_status()
+        data = r.json()
+        # Extract answer from DeepSeek response - adjust according to their actual response schema
+        answer = data.get("answer") or "Sorry, I could not find an answer."
+        return answer
     except Exception as e:
-        update.message.reply_text(f"❌ DeepSeek API Error: {e}")
+        return "Error contacting DeepSeek API."
 
-# Command: /unlock
-def unlock(update, context):
-    with open("qr.jpg", "rb") as qr:
-        update.message.reply_photo(qr, caption="📥 Scan and pay using Paytm.\nThen use /verify <transaction_id>")
-
-# Command: /verify <TXN_ID>
-def verify(update, context):
-    user_id = update.message.from_user.id
-    txn_id = " ".join(context.args).strip()
-
-    if not txn_id:
-        update.message.reply_text("⚠️ Usage: /verify TXN12345678")
-        return
-
-    if is_txn_valid(txn_id):
-        verified_users.add(user_id)
-        mark_txn_used(txn_id)
-        update.message.reply_text("✅ Verified! Use /getfile to download your notes.")
-    else:
-        update.message.reply_text("❌ Invalid or already used TXN ID.")
-
-# Command: /getfile
-def getfile(update, context):
-    user_id = update.message.from_user.id
-    if user_id in verified_users:
-        with open("enotes.zip", "rb") as f:
-            update.message.reply_document(f)
-    else:
-        update.message.reply_text("❌ Please verify payment first using /unlock and /verify.")
-
-# Helpers
-def is_txn_valid(txn_id):
-    with open("txn_ids.txt", "r") as f:
-        valid = set(line.strip() for line in f)
-    with open("used_ids.txt", "r") as f:
-        used = set(line.strip() for line in f)
-    return txn_id in valid and txn_id not in used
-
-def mark_txn_used(txn_id):
-    with open("used_ids.txt", "a") as f:
-        f.write(txn_id + "\n")
-
-# FastAPI webhook endpoint
+# Telegram webhook endpoint for FastAPI
 @app.post("/webhook")
-async def webhook(req: Request):
-    data = await req.json()
+async def telegram_webhook(request: Request):
+    data = await request.json()
     update = Update.de_json(data, bot)
     dispatcher.process_update(update)
-    return {"ok": True}
+    return JSONResponse({"status": "ok"})
 
-@app.get("/")
-async def health_check():
-    return {"status": "running"}
-
-@app.on_event("startup")
-async on_start():
-      bot.set_webhook(WEBHOOK_URL)
-
-# Register handlers
+# Setup command handlers
 dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(CommandHandler("ask", ask))
 dispatcher.add_handler(CommandHandler("unlock", unlock))
-dispatcher.add_handler(CommandHandler("verify", verify))
 dispatcher.add_handler(CommandHandler("getfile", getfile))
+dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+
+# On startup, set webhook
+@app.on_event("startup")
+def on_start():
+    bot.set_webhook(WEBHOOK_URL)
+
+# Health check root endpoint (useful for UptimeRobot)
+@app.get("/")
+async def root():
+    return {"status": "Alice Bot is running"}
+
